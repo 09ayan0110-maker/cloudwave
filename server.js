@@ -7,7 +7,7 @@ const root = __dirname;
 const dataDir = path.join(root, "data");
 const dbPath = path.join(dataDir, "cloudwave-db.json");
 const port = process.env.PORT || 3000;
-const host = process.env.HOST || "127.0.0.1";
+const host = process.env.HOST || "0.0.0.0";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
