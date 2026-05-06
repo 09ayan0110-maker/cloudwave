@@ -152,10 +152,6 @@ function setScreen(name) {
     showToast("Create an account to use this section");
     name = "auth";
   }
-  if (currentUser && !currentUser.emailVerified && ["sell", "messages"].includes(name)) {
-    showToast("Verify your email to unlock this section");
-    name = "auth";
-  }
   if (name === "admin" && currentUser?.role !== "Admin") {
     showToast("Admin access required");
     name = "home";
@@ -826,8 +822,8 @@ function toggleSave(id) {
 }
 
 function startNegotiation(id) {
-  if (!currentUser?.emailVerified) {
-    showToast(currentUser ? "Verify your email to message sellers." : "Create an account to message sellers.");
+  if (!currentUser) {
+    showToast("Create an account to message sellers.");
     setScreen("auth");
     return;
   }
@@ -857,11 +853,11 @@ function updateProfileStats() {
   if (profileName) profileName.textContent = currentUser?.name || "Guest";
   if (profileBio) {
     profileBio.textContent = currentUser
-      ? `${currentUser.role} account ${currentUser.emailVerified ? "with verified email." : "waiting for email verification."}`
+      ? `${currentUser.role} account using live user-created data.`
       : "Create an account to sell, save, and message.";
   }
   if (profileInitials) profileInitials.textContent = currentUser ? initialsFor(currentUser.name) : "G";
-  if (profileRole) profileRole.textContent = currentUser ? `${currentUser.role} - ${currentUser.emailVerified ? "Verified" : "Unverified"}` : "Guest";
+  if (profileRole) profileRole.textContent = currentUser?.role || "Guest";
 }
 
 function renderHomeStats(serverStats = null) {
@@ -968,11 +964,9 @@ async function createAccount() {
       const data = await apiRequest("/api/register", { method: "POST", body: JSON.stringify({ name, email, role, password, adminCode }) });
       saveAuthToken(data.token);
       applyServerData(data);
-      const tokenInput = document.querySelector("#verification-token");
-      if (tokenInput && data.verificationToken) tokenInput.value = data.verificationToken;
       await loadAdminIdeas();
-      showToast(data.message || "Account created. Verify your email to continue.");
-      setScreen("auth");
+      showToast(data.message || "Account created");
+      setScreen("home");
     } catch (error) {
       showToast(error.message);
     }
@@ -1005,39 +999,7 @@ async function loginAccount() {
     applyServerData(data);
     await loadAdminIdeas();
     showToast(data.message || "Logged in");
-    setScreen(data.user?.emailVerified ? "home" : "auth");
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-async function verifyEmail() {
-  const token = document.querySelector("#verification-token")?.value.trim();
-  if (!token) {
-    showToast("Enter the verification token from your email.");
-    return;
-  }
-  try {
-    const data = await apiRequest("/api/verify-email", { method: "POST", body: JSON.stringify({ token }) });
-    applyServerData(data);
-    await loadAdminIdeas();
-    showToast(data.message || "Email verified");
     setScreen("home");
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-async function resendVerification() {
-  if (!currentUser) {
-    showToast("Log in before requesting a new verification token.");
-    return;
-  }
-  try {
-    const data = await apiRequest("/api/resend-verification", { method: "POST" });
-    const tokenInput = document.querySelector("#verification-token");
-    if (tokenInput && data.verificationToken) tokenInput.value = data.verificationToken;
-    showToast(data.message || "Verification token sent");
   } catch (error) {
     showToast(error.message);
   }
@@ -1199,8 +1161,6 @@ messageForm.addEventListener("submit", (event) => {
 
 document.querySelector("#create-account")?.addEventListener("click", createAccount);
 document.querySelector("#login-account")?.addEventListener("click", loginAccount);
-document.querySelector("#verify-email")?.addEventListener("click", verifyEmail);
-document.querySelector("#resend-verification")?.addEventListener("click", resendVerification);
 document.querySelector("#forgot-password")?.addEventListener("click", forgotPassword);
 document.querySelector("#reset-password-button")?.addEventListener("click", resetPassword);
 document.querySelector("#change-password-button")?.addEventListener("click", changePassword);
@@ -1213,12 +1173,7 @@ document.querySelector("#continue-guest")?.addEventListener("click", () => {
 
 async function initApp() {
   const params = new URLSearchParams(location.search);
-  const verificationParam = params.get("verify");
   const resetParam = params.get("reset");
-  if (verificationParam) {
-    const input = document.querySelector("#verification-token");
-    if (input) input.value = verificationParam;
-  }
   if (resetParam) {
     const input = document.querySelector("#reset-token");
     if (input) input.value = resetParam;

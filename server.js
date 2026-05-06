@@ -12,6 +12,9 @@ const adminCode = process.env.ADMIN_CODE || "CLOUDWAVE-ADMIN";
 const sessionTtlMs = 7 * 24 * 60 * 60 * 1000;
 const oneHourMs = 60 * 60 * 1000;
 const exposeDevTokens = process.env.NODE_ENV !== "production";
+const resendApiKey = process.env.RESEND_API_KEY || "";
+const fromEmail = process.env.FROM_EMAIL || "Cloudwave <onboarding@resend.dev>";
+const appUrl = process.env.APP_URL || "";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -106,11 +109,11 @@ function createSession(db, user) {
 
 function publicUser(user) {
   if (!user) return null;
-  return { id: user.id, name: user.name, email: user.email, role: user.role, emailVerified: Boolean(user.emailVerified), createdAt: user.createdAt };
+  return { id: user.id, name: user.name, email: user.email, role: user.role, emailVerified: true, createdAt: user.createdAt };
 }
 
 function isAdmin(user) {
-  return user?.role === "Admin" && user.emailVerified;
+  return user?.role === "Admin";
 }
 
 function requireVerified(user, res) {
@@ -118,35 +121,52 @@ function requireVerified(user, res) {
     json(res, 401, { error: "Please log in first." });
     return false;
   }
-  if (!user.emailVerified) {
-    json(res, 403, { error: "Please verify your email before using this feature.", code: "EMAIL_NOT_VERIFIED" });
+  return true;
+}
+
+function appOrigin(req) {
+  if (appUrl) return appUrl.replace(/\/$/, "");
+  const protocol = req.headers["x-forwarded-proto"] || "http";
+  const hostHeader = req.headers["x-forwarded-host"] || req.headers.host;
+  return `${protocol}://${hostHeader}`;
+}
+
+async function sendEmail({ to, subject, html, text }) {
+  if (!resendApiKey) {
+    console.log(`Email not sent to ${to}: RESEND_API_KEY is not configured.`);
     return false;
+  }
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${resendApiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ from: fromEmail, to, subject, html, text }),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Email provider rejected the message: ${detail || response.status}`);
   }
   return true;
 }
 
-function issueEmailVerification(db, user, req) {
-  const token = crypto.randomBytes(24).toString("hex");
-  db.emailVerificationTokens[token] = {
-    userId: user.id,
-    expiresAt: new Date(Date.now() + 24 * oneHourMs).toISOString(),
-  };
-  const origin = `http://${req.headers.host}`;
-  const link = `${origin}/?verify=${encodeURIComponent(token)}`;
-  console.log(`Email verification for ${user.email}: ${link}`);
-  return { token, link };
-}
-
-function issuePasswordReset(db, user, req) {
+async function issuePasswordReset(db, user, req) {
   const token = crypto.randomBytes(24).toString("hex");
   db.passwordResetTokens[token] = {
     userId: user.id,
     expiresAt: new Date(Date.now() + oneHourMs).toISOString(),
   };
-  const origin = `http://${req.headers.host}`;
+  const origin = appOrigin(req);
   const link = `${origin}/?reset=${encodeURIComponent(token)}`;
+  const sent = await sendEmail({
+    to: user.email,
+    subject: "Reset your Cloudwave password",
+    text: `Reset your Cloudwave password by opening this link: ${link}\n\nThis token expires in 1 hour. If you did not request it, you can ignore this email.`,
+    html: `<p>Reset your Cloudwave password.</p><p><a href="${link}">Reset password</a></p><p>This token expires in 1 hour. If you did not request it, you can ignore this email.</p>`,
+  });
   console.log(`Password reset for ${user.email}: ${link}`);
-  return { token, link };
+  return { token, link, sent };
 }
 
 function tokenRecordIsValid(record) {
@@ -203,7 +223,7 @@ async function handleApi(req, res) {
     return json(res, 200, {
       user: publicUser(user),
       ideas: db.ideas,
-      chats: user?.emailVerified ? db.chats.filter((chat) => chat.userIds.includes(user.id)) : [],
+      chats: user ? db.chats.filter((chat) => chat.userIds.includes(user.id)) : [],
       adminIdeas: isAdmin(user) ? db.ideas : [],
       stats: { users: db.users.length, ideas: db.ideas.length },
     });
@@ -219,19 +239,16 @@ async function handleApi(req, res) {
     if (!name || !email || password.length < 6) return json(res, 400, { error: "Name, email, and a 6+ character password are required." });
     if (role === "Admin" && submittedAdminCode !== adminCode) return json(res, 403, { error: "Invalid admin code." });
     if (db.users.some((user) => user.email === email)) return json(res, 409, { error: "Email is already registered." });
-    const user = { id: crypto.randomUUID(), name, email, role, passwordHash: hashPassword(password), emailVerified: false, createdAt: new Date().toISOString() };
+    const user = { id: crypto.randomUUID(), name, email, role, passwordHash: hashPassword(password), emailVerified: true, createdAt: new Date().toISOString() };
     const token = createSession(db, user);
     db.users.push(user);
-    const verification = issueEmailVerification(db, user, req);
     writeDb(db);
     return json(res, 201, {
       token,
       user: publicUser(user),
       ideas: db.ideas,
       chats: [],
-      verificationToken: verification.token,
-      verificationLink: verification.link,
-      message: "Account created. Check your email for the verification token before using protected features.",
+      message: "Account created. You can use Cloudwave now.",
     });
   }
 
@@ -247,8 +264,8 @@ async function handleApi(req, res) {
       token,
       user: publicUser(user),
       ideas: db.ideas,
-      chats: user.emailVerified ? db.chats.filter((chat) => chat.userIds.includes(user.id)) : [],
-      message: user.emailVerified ? "Logged in." : "Logged in with limited access. Verify your email to unlock protected features.",
+      chats: db.chats.filter((chat) => chat.userIds.includes(user.id)),
+      message: "Logged in.",
     });
   }
 
@@ -259,38 +276,11 @@ async function handleApi(req, res) {
     return json(res, 200, { message: "Logged out." });
   }
 
-  if (req.method === "POST" && url.pathname === "/api/verify-email") {
-    const body = await readBody(req);
-    const token = String(body.token || "").trim();
-    const record = db.emailVerificationTokens[token];
-    if (!tokenRecordIsValid(record)) return json(res, 400, { error: "Verification token is invalid or expired." });
-    const user = db.users.find((item) => item.id === record.userId);
-    if (!user) return json(res, 404, { error: "User for this verification token was not found." });
-    user.emailVerified = true;
-    user.emailVerifiedAt = new Date().toISOString();
-    delete db.emailVerificationTokens[token];
-    writeDb(db);
-    return json(res, 200, { user: publicUser(user), message: "Email verified. Full access is now enabled." });
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/resend-verification") {
-    const user = userFromToken(req, db);
-    if (!user) return json(res, 401, { error: "Please log in first." });
-    if (user.emailVerified) return json(res, 200, { user: publicUser(user), message: "Email is already verified." });
-    const verification = issueEmailVerification(db, user, req);
-    writeDb(db);
-    return json(res, 200, {
-      verificationToken: verification.token,
-      verificationLink: verification.link,
-      message: "A new verification token has been sent.",
-    });
-  }
-
   if (req.method === "POST" && url.pathname === "/api/forgot-password") {
     const body = await readBody(req);
     const email = String(body.email || "").trim().toLowerCase();
     const user = db.users.find((item) => item.email === email);
-    const reset = user ? issuePasswordReset(db, user, req) : null;
+    const reset = user ? await issuePasswordReset(db, user, req) : null;
     writeDb(db);
     return json(res, 200, {
       message: "If that email exists, a password reset token has been sent.",
