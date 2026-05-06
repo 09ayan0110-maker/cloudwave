@@ -9,6 +9,9 @@ const dbPath = path.join(dataDir, "cloudwave-db.json");
 const port = process.env.PORT || 3000;
 const host = process.env.HOST || "0.0.0.0";
 const adminCode = process.env.ADMIN_CODE || "CLOUDWAVE-ADMIN";
+const sessionTtlMs = 7 * 24 * 60 * 60 * 1000;
+const oneHourMs = 60 * 60 * 1000;
+const exposeDevTokens = process.env.NODE_ENV !== "production";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -18,13 +21,25 @@ const mimeTypes = {
 };
 
 function initialDb() {
-  return { users: [], ideas: [], chats: [], sessions: {} };
+  return { users: [], ideas: [], chats: [], sessions: {}, emailVerificationTokens: {}, passwordResetTokens: {} };
 }
 
 function readDb() {
   if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
   if (!fs.existsSync(dbPath)) fs.writeFileSync(dbPath, JSON.stringify(initialDb(), null, 2));
-  return JSON.parse(fs.readFileSync(dbPath, "utf8"));
+  const db = JSON.parse(fs.readFileSync(dbPath, "utf8"));
+  db.users ||= [];
+  db.ideas ||= [];
+  db.chats ||= [];
+  db.sessions ||= {};
+  db.emailVerificationTokens ||= {};
+  db.passwordResetTokens ||= {};
+  for (const [token, session] of Object.entries(db.sessions)) {
+    if (typeof session === "string") {
+      db.sessions[token] = { userId: session, expiresAt: new Date(Date.now() + sessionTtlMs).toISOString() };
+    }
+  }
+  return db;
 }
 
 function writeDb(db) {
@@ -60,24 +75,82 @@ function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
 
 function verifyPassword(password, saved) {
   const [salt, hash] = String(saved).split(":");
+  if (!salt || !hash) return false;
   const attempt = crypto.scryptSync(password, salt, 64).toString("hex");
   return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(attempt, "hex"));
 }
 
-function userFromToken(req, db) {
+function tokenFromReq(req) {
   const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  const userId = db.sessions[token];
-  return db.users.find((user) => user.id === userId) || null;
+  return auth.startsWith("Bearer ") ? auth.slice(7) : "";
+}
+
+function userFromToken(req, db) {
+  const token = tokenFromReq(req);
+  const session = db.sessions[token];
+  if (!session) return null;
+  const expiresAt = new Date(session.expiresAt).getTime();
+  if (!expiresAt || expiresAt <= Date.now()) {
+    delete db.sessions[token];
+    writeDb(db);
+    return null;
+  }
+  return db.users.find((user) => user.id === session.userId) || null;
+}
+
+function createSession(db, user) {
+  const token = crypto.randomUUID();
+  db.sessions[token] = { userId: user.id, expiresAt: new Date(Date.now() + sessionTtlMs).toISOString() };
+  return token;
 }
 
 function publicUser(user) {
   if (!user) return null;
-  return { id: user.id, name: user.name, email: user.email, role: user.role, createdAt: user.createdAt };
+  return { id: user.id, name: user.name, email: user.email, role: user.role, emailVerified: Boolean(user.emailVerified), createdAt: user.createdAt };
 }
 
 function isAdmin(user) {
-  return user?.role === "Admin";
+  return user?.role === "Admin" && user.emailVerified;
+}
+
+function requireVerified(user, res) {
+  if (!user) {
+    json(res, 401, { error: "Please log in first." });
+    return false;
+  }
+  if (!user.emailVerified) {
+    json(res, 403, { error: "Please verify your email before using this feature.", code: "EMAIL_NOT_VERIFIED" });
+    return false;
+  }
+  return true;
+}
+
+function issueEmailVerification(db, user, req) {
+  const token = crypto.randomBytes(24).toString("hex");
+  db.emailVerificationTokens[token] = {
+    userId: user.id,
+    expiresAt: new Date(Date.now() + 24 * oneHourMs).toISOString(),
+  };
+  const origin = `http://${req.headers.host}`;
+  const link = `${origin}/?verify=${encodeURIComponent(token)}`;
+  console.log(`Email verification for ${user.email}: ${link}`);
+  return { token, link };
+}
+
+function issuePasswordReset(db, user, req) {
+  const token = crypto.randomBytes(24).toString("hex");
+  db.passwordResetTokens[token] = {
+    userId: user.id,
+    expiresAt: new Date(Date.now() + oneHourMs).toISOString(),
+  };
+  const origin = `http://${req.headers.host}`;
+  const link = `${origin}/?reset=${encodeURIComponent(token)}`;
+  console.log(`Password reset for ${user.email}: ${link}`);
+  return { token, link };
+}
+
+function tokenRecordIsValid(record) {
+  return record && new Date(record.expiresAt).getTime() > Date.now();
 }
 
 function wordCount(text) {
@@ -130,7 +203,7 @@ async function handleApi(req, res) {
     return json(res, 200, {
       user: publicUser(user),
       ideas: db.ideas,
-      chats: user ? db.chats.filter((chat) => chat.userIds.includes(user.id)) : [],
+      chats: user?.emailVerified ? db.chats.filter((chat) => chat.userIds.includes(user.id)) : [],
       adminIdeas: isAdmin(user) ? db.ideas : [],
       stats: { users: db.users.length, ideas: db.ideas.length },
     });
@@ -146,12 +219,20 @@ async function handleApi(req, res) {
     if (!name || !email || password.length < 6) return json(res, 400, { error: "Name, email, and a 6+ character password are required." });
     if (role === "Admin" && submittedAdminCode !== adminCode) return json(res, 403, { error: "Invalid admin code." });
     if (db.users.some((user) => user.email === email)) return json(res, 409, { error: "Email is already registered." });
-    const user = { id: crypto.randomUUID(), name, email, role, passwordHash: hashPassword(password), createdAt: new Date().toISOString() };
-    const token = crypto.randomUUID();
+    const user = { id: crypto.randomUUID(), name, email, role, passwordHash: hashPassword(password), emailVerified: false, createdAt: new Date().toISOString() };
+    const token = createSession(db, user);
     db.users.push(user);
-    db.sessions[token] = user.id;
+    const verification = issueEmailVerification(db, user, req);
     writeDb(db);
-    return json(res, 201, { token, user: publicUser(user), ideas: db.ideas, chats: [] });
+    return json(res, 201, {
+      token,
+      user: publicUser(user),
+      ideas: db.ideas,
+      chats: [],
+      verificationToken: verification.token,
+      verificationLink: verification.link,
+      message: "Account created. Check your email for the verification token before using protected features.",
+    });
   }
 
   if (req.method === "POST" && url.pathname === "/api/login") {
@@ -160,20 +241,104 @@ async function handleApi(req, res) {
     const password = String(body.password || "").trim();
     const user = db.users.find((item) => item.email === email);
     if (!user || !verifyPassword(password, user.passwordHash)) return json(res, 401, { error: "Invalid email or password." });
-    const token = crypto.randomUUID();
-    db.sessions[token] = user.id;
+    const token = createSession(db, user);
     writeDb(db);
     return json(res, 200, {
       token,
       user: publicUser(user),
       ideas: db.ideas,
-      chats: db.chats.filter((chat) => chat.userIds.includes(user.id)),
+      chats: user.emailVerified ? db.chats.filter((chat) => chat.userIds.includes(user.id)) : [],
+      message: user.emailVerified ? "Logged in." : "Logged in with limited access. Verify your email to unlock protected features.",
     });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/logout") {
+    const token = tokenFromReq(req);
+    if (token) delete db.sessions[token];
+    writeDb(db);
+    return json(res, 200, { message: "Logged out." });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/verify-email") {
+    const body = await readBody(req);
+    const token = String(body.token || "").trim();
+    const record = db.emailVerificationTokens[token];
+    if (!tokenRecordIsValid(record)) return json(res, 400, { error: "Verification token is invalid or expired." });
+    const user = db.users.find((item) => item.id === record.userId);
+    if (!user) return json(res, 404, { error: "User for this verification token was not found." });
+    user.emailVerified = true;
+    user.emailVerifiedAt = new Date().toISOString();
+    delete db.emailVerificationTokens[token];
+    writeDb(db);
+    return json(res, 200, { user: publicUser(user), message: "Email verified. Full access is now enabled." });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/resend-verification") {
+    const user = userFromToken(req, db);
+    if (!user) return json(res, 401, { error: "Please log in first." });
+    if (user.emailVerified) return json(res, 200, { user: publicUser(user), message: "Email is already verified." });
+    const verification = issueEmailVerification(db, user, req);
+    writeDb(db);
+    return json(res, 200, {
+      verificationToken: verification.token,
+      verificationLink: verification.link,
+      message: "A new verification token has been sent.",
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/forgot-password") {
+    const body = await readBody(req);
+    const email = String(body.email || "").trim().toLowerCase();
+    const user = db.users.find((item) => item.email === email);
+    const reset = user ? issuePasswordReset(db, user, req) : null;
+    writeDb(db);
+    return json(res, 200, {
+      message: "If that email exists, a password reset token has been sent.",
+      ...(exposeDevTokens && reset ? { resetToken: reset.token, resetLink: reset.link } : {}),
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/reset-password") {
+    const body = await readBody(req);
+    const token = String(body.token || "").trim();
+    const password = String(body.password || "").trim();
+    if (password.length < 6) return json(res, 400, { error: "New password must be at least 6 characters." });
+    const record = db.passwordResetTokens[token];
+    if (!tokenRecordIsValid(record)) return json(res, 400, { error: "Password reset token is invalid or expired." });
+    const user = db.users.find((item) => item.id === record.userId);
+    if (!user) return json(res, 404, { error: "User for this reset token was not found." });
+    user.passwordHash = hashPassword(password);
+    user.passwordChangedAt = new Date().toISOString();
+    delete db.passwordResetTokens[token];
+    for (const [sessionToken, session] of Object.entries(db.sessions)) {
+      if (session.userId === user.id) delete db.sessions[sessionToken];
+    }
+    writeDb(db);
+    return json(res, 200, { message: "Password reset. Please log in with the new password." });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/profile/change-password") {
+    const user = userFromToken(req, db);
+    if (!requireVerified(user, res)) return;
+    const body = await readBody(req);
+    const currentPassword = String(body.currentPassword || "").trim();
+    const newPassword = String(body.newPassword || "").trim();
+    if (!verifyPassword(currentPassword, user.passwordHash)) return json(res, 401, { error: "Current password is incorrect." });
+    if (newPassword.length < 6) return json(res, 400, { error: "New password must be at least 6 characters." });
+    if (currentPassword === newPassword) return json(res, 400, { error: "New password must be different from the current password." });
+    user.passwordHash = hashPassword(newPassword);
+    user.passwordChangedAt = new Date().toISOString();
+    const activeToken = tokenFromReq(req);
+    for (const [sessionToken, session] of Object.entries(db.sessions)) {
+      if (session.userId === user.id && sessionToken !== activeToken) delete db.sessions[sessionToken];
+    }
+    writeDb(db);
+    return json(res, 200, { message: "Password changed." });
   }
 
   if (req.method === "POST" && url.pathname === "/api/ideas") {
     const user = userFromToken(req, db);
-    if (!user) return json(res, 401, { error: "Please log in first." });
+    if (!requireVerified(user, res)) return;
     const body = await readBody(req);
     if (!validateIdeaPackage(body)) return json(res, 400, { error: "Listing package is too weak. Add 300+ words, competitor gaps, roadmap, marketing/pricing strategy, and ownership declaration." });
     const idea = {

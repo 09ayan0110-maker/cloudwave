@@ -86,24 +86,33 @@ function saveAuthToken(token) {
 
 async function apiRequest(path, options = {}) {
   if (!apiAvailable) throw new Error("Open through the server to use shared registration.");
-  const response = await fetch(path, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-      ...(options.headers || {}),
-    },
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "Request failed");
-  return data;
+  try {
+    const response = await fetch(path, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        ...(options.headers || {}),
+      },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const message = data.error || data.message || `Request failed with status ${response.status}.`;
+      const error = new Error(message);
+      error.code = data.code;
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  } catch (error) {
+    if (error instanceof TypeError) throw new Error("Could not reach the server. Check that it is running, then try again.");
+    throw error;
+  }
 }
 
 function applyServerData(data) {
-  if (data.user) {
-    currentUser = data.user;
-    saveCurrentUser();
-  }
+  if ("user" in data) currentUser = data.user;
+  saveCurrentUser();
   if (Array.isArray(data.ideas)) {
     ideas = data.ideas;
     saveIdeas();
@@ -141,6 +150,10 @@ function showToast(message) {
 function setScreen(name) {
   if (!currentUser && ["sell", "messages", "profile"].includes(name)) {
     showToast("Create an account to use this section");
+    name = "auth";
+  }
+  if (currentUser && !currentUser.emailVerified && ["sell", "messages"].includes(name)) {
+    showToast("Verify your email to unlock this section");
     name = "auth";
   }
   if (name === "admin" && currentUser?.role !== "Admin") {
@@ -813,6 +826,11 @@ function toggleSave(id) {
 }
 
 function startNegotiation(id) {
+  if (!currentUser?.emailVerified) {
+    showToast(currentUser ? "Verify your email to message sellers." : "Create an account to message sellers.");
+    setScreen("auth");
+    return;
+  }
   const idea = ideas.find((item) => String(item.id) === String(id));
   if (idea) {
     const chat = findOrCreateConversation(idea);
@@ -837,9 +855,13 @@ function updateProfileStats() {
   const profileInitials = document.querySelector("#profile-initials");
   const profileRole = document.querySelector("#profile-role");
   if (profileName) profileName.textContent = currentUser?.name || "Guest";
-  if (profileBio) profileBio.textContent = currentUser ? `${currentUser.role} account using only live user-created data.` : "Create an account to sell, save, and message.";
+  if (profileBio) {
+    profileBio.textContent = currentUser
+      ? `${currentUser.role} account ${currentUser.emailVerified ? "with verified email." : "waiting for email verification."}`
+      : "Create an account to sell, save, and message.";
+  }
   if (profileInitials) profileInitials.textContent = currentUser ? initialsFor(currentUser.name) : "G";
-  if (profileRole) profileRole.textContent = currentUser?.role || "Guest";
+  if (profileRole) profileRole.textContent = currentUser ? `${currentUser.role} - ${currentUser.emailVerified ? "Verified" : "Unverified"}` : "Guest";
 }
 
 function renderHomeStats(serverStats = null) {
@@ -946,9 +968,11 @@ async function createAccount() {
       const data = await apiRequest("/api/register", { method: "POST", body: JSON.stringify({ name, email, role, password, adminCode }) });
       saveAuthToken(data.token);
       applyServerData(data);
+      const tokenInput = document.querySelector("#verification-token");
+      if (tokenInput && data.verificationToken) tokenInput.value = data.verificationToken;
       await loadAdminIdeas();
-      showToast("Account created");
-      setScreen("home");
+      showToast(data.message || "Account created. Verify your email to continue.");
+      setScreen("auth");
     } catch (error) {
       showToast(error.message);
     }
@@ -980,11 +1004,114 @@ async function loginAccount() {
     saveAuthToken(data.token);
     applyServerData(data);
     await loadAdminIdeas();
-    showToast("Logged in");
+    showToast(data.message || "Logged in");
+    setScreen(data.user?.emailVerified ? "home" : "auth");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function verifyEmail() {
+  const token = document.querySelector("#verification-token")?.value.trim();
+  if (!token) {
+    showToast("Enter the verification token from your email.");
+    return;
+  }
+  try {
+    const data = await apiRequest("/api/verify-email", { method: "POST", body: JSON.stringify({ token }) });
+    applyServerData(data);
+    await loadAdminIdeas();
+    showToast(data.message || "Email verified");
     setScreen("home");
   } catch (error) {
     showToast(error.message);
   }
+}
+
+async function resendVerification() {
+  if (!currentUser) {
+    showToast("Log in before requesting a new verification token.");
+    return;
+  }
+  try {
+    const data = await apiRequest("/api/resend-verification", { method: "POST" });
+    const tokenInput = document.querySelector("#verification-token");
+    if (tokenInput && data.verificationToken) tokenInput.value = data.verificationToken;
+    showToast(data.message || "Verification token sent");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function forgotPassword() {
+  const email = document.querySelector("#signup-email")?.value.trim();
+  if (!email) {
+    showToast("Enter your email first.");
+    return;
+  }
+  try {
+    const data = await apiRequest("/api/forgot-password", { method: "POST", body: JSON.stringify({ email }) });
+    const tokenInput = document.querySelector("#reset-token");
+    if (tokenInput && data.resetToken) tokenInput.value = data.resetToken;
+    showToast(data.message || "Password reset token sent");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function resetPassword() {
+  const token = document.querySelector("#reset-token")?.value.trim();
+  const password = document.querySelector("#reset-password")?.value.trim();
+  if (!token || password.length < 6) {
+    showToast("Enter the reset token and a new 6+ character password.");
+    return;
+  }
+  try {
+    const data = await apiRequest("/api/reset-password", { method: "POST", body: JSON.stringify({ token, password }) });
+    saveAuthToken("");
+    currentUser = null;
+    saveCurrentUser();
+    showToast(data.message || "Password reset");
+    setScreen("auth");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function changePassword() {
+  const currentPassword = document.querySelector("#current-password")?.value.trim();
+  const newPassword = document.querySelector("#new-password")?.value.trim();
+  if (!currentPassword || newPassword.length < 6) {
+    showToast("Enter your current password and a new 6+ character password.");
+    return;
+  }
+  try {
+    const data = await apiRequest("/api/profile/change-password", { method: "POST", body: JSON.stringify({ currentPassword, newPassword }) });
+    document.querySelector("#current-password").value = "";
+    document.querySelector("#new-password").value = "";
+    showToast(data.message || "Password changed");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function logoutAccount() {
+  try {
+    if (apiAvailable && authToken) await apiRequest("/api/logout", { method: "POST" });
+  } catch (error) {
+    showToast(error.message);
+  }
+  saveAuthToken("");
+  currentUser = null;
+  conversations = [];
+  adminIdeas = [];
+  saveCurrentUser();
+  renderConversations();
+  renderActiveChat();
+  renderAdminPanel();
+  updateProfileStats();
+  showToast("Logged out");
+  setScreen("auth");
 }
 
 navButtons.forEach((button) => {
@@ -1072,6 +1199,12 @@ messageForm.addEventListener("submit", (event) => {
 
 document.querySelector("#create-account")?.addEventListener("click", createAccount);
 document.querySelector("#login-account")?.addEventListener("click", loginAccount);
+document.querySelector("#verify-email")?.addEventListener("click", verifyEmail);
+document.querySelector("#resend-verification")?.addEventListener("click", resendVerification);
+document.querySelector("#forgot-password")?.addEventListener("click", forgotPassword);
+document.querySelector("#reset-password-button")?.addEventListener("click", resetPassword);
+document.querySelector("#change-password-button")?.addEventListener("click", changePassword);
+document.querySelector("#logout-account")?.addEventListener("click", logoutAccount);
 
 document.querySelector("#continue-guest")?.addEventListener("click", () => {
   showToast("Browsing as guest");
@@ -1079,6 +1212,17 @@ document.querySelector("#continue-guest")?.addEventListener("click", () => {
 });
 
 async function initApp() {
+  const params = new URLSearchParams(location.search);
+  const verificationParam = params.get("verify");
+  const resetParam = params.get("reset");
+  if (verificationParam) {
+    const input = document.querySelector("#verification-token");
+    if (input) input.value = verificationParam;
+  }
+  if (resetParam) {
+    const input = document.querySelector("#reset-token");
+    if (input) input.value = resetParam;
+  }
   if (apiAvailable) {
     try {
       applyServerData(await apiRequest("/api/bootstrap"));
