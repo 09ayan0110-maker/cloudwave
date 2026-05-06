@@ -242,9 +242,55 @@ function estimateIdeaValue(idea) {
   };
 }
 
+function packageText(idea) {
+  return [
+    idea.summary,
+    idea.target,
+    idea.model,
+    idea.whyNow,
+    idea.roadmap,
+    idea.competitorGaps,
+    idea.marketingStrategy,
+    idea.pricingStrategy,
+    idea.assets,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function wordCount(text) {
+  return String(text).trim().split(/\s+/).filter(Boolean).length;
+}
+
+function qualityGate(idea) {
+  const text = packageText(idea);
+  const words = wordCount(text);
+  const checks = [
+    { label: "300+ word business package", pass: words >= 300 },
+    { label: "Real customer pain point", pass: wordCount(idea.whyNow) >= 25 || wordCount(idea.summary) >= 25 },
+    { label: "Target customer defined", pass: wordCount(idea.target) >= 4 },
+    { label: "Revenue plan included", pass: wordCount(idea.model) >= 1 },
+    { label: "Competitor gaps explained", pass: wordCount(idea.competitorGaps) >= 20 },
+    { label: "MVP roadmap included", pass: wordCount(idea.roadmap) >= 25 },
+    { label: "Marketing strategy included", pass: wordCount(idea.marketingStrategy) >= 20 },
+    { label: "Pricing strategy included", pass: wordCount(idea.pricingStrategy) >= 15 },
+    { label: "Ownership declared", pass: Boolean(idea.ownershipDeclared) },
+  ];
+  const passed = checks.filter((check) => check.pass).length;
+  const score = Math.round((passed / checks.length) * 100);
+  return {
+    score,
+    words,
+    checks,
+    approved: score >= 85 && words >= 300,
+    missing: checks.filter((check) => !check.pass).map((check) => check.label),
+  };
+}
+
 function ideaCard(idea, compact = false) {
   const saved = savedIds.has(String(idea.id));
   const assessment = assessIdea(idea);
+  const quality = qualityGate(idea);
   return `
     <article class="idea-card ${compact ? "compact" : ""}">
       <div class="card-top">
@@ -257,6 +303,7 @@ function ideaCard(idea, compact = false) {
       <div class="tag-row">
         <span class="tag ${tagClass(idea.category)}">${escapeHTML(idea.category)}</span>
         <span class="tag ${tagClass(idea.saleType)}">${escapeHTML(idea.saleType)}</span>
+        <span class="tag ${quality.approved ? "teal" : "amber"}">${escapeHTML(idea.status === "live" ? "Live" : "Pending review")}</span>
         <span class="tag amber">${escapeHTML(idea.competition)} competition</span>
       </div>
       <div class="score-row">
@@ -265,9 +312,9 @@ function ideaCard(idea, compact = false) {
         <span><strong>${escapeHTML(idea.rating)}</strong><small>Seller</small></span>
       </div>
       <div class="ai-score">
-        <span>AI assessment</span>
-        <strong>${assessment.score}/100</strong>
-        <small>${assessment.grade}</small>
+        <span>Listing quality</span>
+        <strong>${quality.score}/100</strong>
+        <small>${quality.approved ? "Review ready" : "Needs work"}</small>
       </div>
       <div class="card-actions">
         <button data-detail="${idea.id}">View Deal</button>
@@ -329,23 +376,25 @@ function renderDetail(id) {
       <button data-negotiate="${idea.id}">Partner<br>${escapeHTML(idea.partner)}</button>
     </div>
     <div class="card-actions">
-      <button data-buy="${idea.id}">Buy Now</button>
+      <button ${idea.status === "live" ? `data-buy="${idea.id}"` : `type="button" data-pending="${idea.id}"`}>${idea.status === "live" ? "Buy Now" : "Pending Review"}</button>
       <button data-message="${idea.id}">Message Seller</button>
       <button data-save="${idea.id}">${saved ? "Saved" : "Save"}</button>
     </div>
     <section class="ai-assessment-panel">
       <div>
-        <span class="story-badge">AI assessment</span>
-        <h3>${assessment.grade}</h3>
-        <p>${assessment.summary}</p>
+        <span class="story-badge">Trust & quality</span>
+        <h3>${idea.status === "live" ? "Live listing" : "Pending moderator review"}</h3>
+        <p>${idea.status === "live" ? "This opportunity passed the listing quality gate." : "This package is submitted but should be reviewed before buyers can purchase."}</p>
       </div>
       <div class="assessment-score">
-        <strong>${assessment.score}</strong>
+        <strong>${qualityGate(idea).score}</strong>
         <span>/100</span>
       </div>
       <div class="assessment-grid">
         <div><b>Risk</b><p>${escapeHTML(assessment.risk)}</p></div>
         <div><b>Recommendation</b><p>${escapeHTML(assessment.recommendation)}</p></div>
+        <div><b>Buyer warning</b><p>Cloudwave lists business opportunities, not guaranteed results. Execution risk remains with the buyer.</p></div>
+        <div><b>Protection</b><p>${idea.ndaRequired ? "NDA required before private details are revealed." : "Seller has not required NDA for this package."} Escrow and transfer agreement are recommended for every purchase.</p></div>
       </div>
     </section>
     <section class="detail-section">
@@ -363,6 +412,18 @@ function renderDetail(id) {
     <section class="detail-section">
       <h3>Why Now?</h3>
       <p>${escapeHTML(idea.whyNow)}</p>
+    </section>
+    <section class="detail-section">
+      <h3>Competitor Gaps</h3>
+      <p>${escapeHTML(idea.competitorGaps || "Not provided yet.")}</p>
+    </section>
+    <section class="detail-section">
+      <h3>Go-To-Market</h3>
+      <p>${escapeHTML(idea.marketingStrategy || "Not provided yet.")}</p>
+    </section>
+    <section class="detail-section">
+      <h3>Pricing Strategy</h3>
+      <p>${escapeHTML(idea.pricingStrategy || "Not provided yet.")}</p>
     </section>
     <section class="detail-section">
       <h3>MVP Roadmap</h3>
@@ -395,11 +456,17 @@ async function createIdeaFromForm() {
   const summary = firstStep.querySelector("textarea").value.trim() || "A new marketplace opportunity.";
   const problem = secondStep.querySelectorAll("textarea")[0].value.trim();
   const solution = secondStep.querySelectorAll("textarea")[1].value.trim();
+  const competitorGaps = secondStep.querySelectorAll("textarea")[2].value.trim();
+  const whyNow = secondStep.querySelectorAll("textarea")[3].value.trim();
   const model = thirdStep.querySelector("select").value;
   const target = thirdStep.querySelector("input").value.trim() || "Early adopters and startup teams";
   const price = thirdStep.querySelectorAll("input")[1].value.trim() || "₹20,000";
+  const marketingStrategy = thirdStep.querySelectorAll("textarea")[0].value.trim();
+  const pricingStrategy = thirdStep.querySelectorAll("textarea")[1].value.trim();
   const saleType = fourthStep.querySelector("select").value;
   const assets = fourthStep.querySelector("textarea").value.trim();
+  const ownershipDeclared = document.querySelector("#ownership-check").checked;
+  const ndaRequired = document.querySelector("#nda-check").checked;
 
   const idea = {
     id: Date.now(),
@@ -416,9 +483,30 @@ async function createIdeaFromForm() {
     saleType,
     target,
     model,
-    whyNow: problem || "The market is ready for faster, simpler startup execution.",
+    whyNow: whyNow || problem || "The market is ready for faster, simpler startup execution.",
+    competitorGaps,
+    marketingStrategy,
+    pricingStrategy,
+    assets,
+    ownershipDeclared,
+    ndaRequired,
+    status: "pending_review",
+    submittedAt: new Date().toISOString(),
     roadmap: [solution, assets].filter(Boolean).join(" ") || "Validate demand, build MVP, launch pilot, close first customers.",
   };
+
+  const quality = qualityGate(idea);
+  if (!quality.approved) {
+    const output = document.querySelector("#ai-output");
+    if (output) {
+      output.innerHTML = `
+        <strong>Not ready for review (${quality.score}/100)</strong>
+        <p>${quality.words}/300 words. Missing: ${escapeHTML(quality.missing.slice(0, 4).join(", "))}${quality.missing.length > 4 ? "..." : ""}</p>
+      `;
+    }
+    showToast("Listing needs more detail before review");
+    return;
+  }
 
   if (apiAvailable && authToken) {
     try {
@@ -436,7 +524,7 @@ async function createIdeaFromForm() {
   renderIdeas();
   renderHomeStats();
   updateProfileStats();
-  showToast("Idea added to Explore");
+  showToast("Submitted for moderator review");
   setScreen("explore");
   updateSellStep(1);
 }
@@ -659,8 +747,14 @@ function currentDraftIdea() {
     saleType: fourthStep.querySelector("select").value,
     target: thirdStep.querySelector("input").value.trim() || "Early adopters",
     model: thirdStep.querySelector("select").value,
-    whyNow: secondStep.querySelectorAll("textarea")[0].value.trim(),
-    roadmap: secondStep.querySelectorAll("textarea")[1].value.trim(),
+    whyNow: secondStep.querySelectorAll("textarea")[3].value.trim() || secondStep.querySelectorAll("textarea")[0].value.trim(),
+    competitorGaps: secondStep.querySelectorAll("textarea")[2].value.trim(),
+    marketingStrategy: thirdStep.querySelectorAll("textarea")[0].value.trim(),
+    pricingStrategy: thirdStep.querySelectorAll("textarea")[1].value.trim(),
+    assets: fourthStep.querySelector("textarea").value.trim(),
+    ownershipDeclared: document.querySelector("#ownership-check").checked,
+    ndaRequired: document.querySelector("#nda-check").checked,
+    roadmap: [secondStep.querySelectorAll("textarea")[1].value.trim(), fourthStep.querySelector("textarea").value.trim()].filter(Boolean).join(" "),
   };
 }
 
@@ -668,9 +762,10 @@ function runDraftAI(tool) {
   const draft = currentDraftIdea();
   const assessment = assessIdea(draft);
   const valuation = estimateIdeaValue(draft);
+  const quality = qualityGate(draft);
   const output = document.querySelector("#ai-output");
   const messages = {
-    improve: `AI score ${assessment.score}/100. ${assessment.recommendation}`,
+    improve: `Quality score ${quality.score}/100 with ${quality.words}/300 words. ${quality.approved ? "This is ready for moderator review." : `Missing: ${quality.missing.slice(0, 4).join(", ")}.`}`,
     price: `Estimated idea value: ${formatRupees(valuation.low)}-${formatRupees(valuation.high)}. Suggested asking price: ${formatRupees(valuation.midpoint)}. ${valuation.verdict}`,
     market: `${assessment.grade}. ${assessment.summary} ${assessment.risk}`,
   };
@@ -818,6 +913,9 @@ document.addEventListener("click", (event) => {
 
   const buyButton = event.target.closest("[data-buy]");
   if (buyButton) showToast("Checkout request created");
+
+  const pendingButton = event.target.closest("[data-pending]");
+  if (pendingButton) showToast("Listing must pass moderator review before purchase");
 
   const categoryButton = event.target.closest(".category-grid [data-filter]");
   if (categoryButton) {
