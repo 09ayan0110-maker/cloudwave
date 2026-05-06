@@ -75,6 +75,36 @@ function publicUser(user) {
   return { id: user.id, name: user.name, email: user.email, role: user.role, createdAt: user.createdAt };
 }
 
+function wordCount(text) {
+  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function validateIdeaPackage(idea) {
+  const fullText = [
+    idea.summary,
+    idea.target,
+    idea.model,
+    idea.whyNow,
+    idea.roadmap,
+    idea.competitorGaps,
+    idea.marketingStrategy,
+    idea.pricingStrategy,
+    idea.assets,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const checks = [
+    wordCount(fullText) >= 300,
+    wordCount(idea.target) >= 4,
+    wordCount(idea.competitorGaps) >= 20,
+    wordCount(idea.roadmap) >= 25,
+    wordCount(idea.marketingStrategy) >= 20,
+    wordCount(idea.pricingStrategy) >= 15,
+    Boolean(idea.ownershipDeclared),
+  ];
+  return checks.filter(Boolean).length >= checks.length - 1;
+}
+
 function serveFile(req, res) {
   const urlPath = decodeURIComponent(new URL(req.url, `http://${req.headers.host}`).pathname);
   const safePath = urlPath === "/" ? "/index.html" : urlPath;
@@ -137,12 +167,14 @@ async function handleApi(req, res) {
     const user = userFromToken(req, db);
     if (!user) return json(res, 401, { error: "Please log in first." });
     const body = await readBody(req);
+    if (!validateIdeaPackage(body)) return json(res, 400, { error: "Listing package is too weak. Add 300+ words, competitor gaps, roadmap, marketing/pricing strategy, and ownership declaration." });
     const idea = {
       ...body,
       id: crypto.randomUUID(),
       seller: user.name,
       ownerId: user.id,
       rating: "New",
+      status: "pending_review",
       createdAt: new Date().toISOString(),
     };
     db.ideas.unshift(idea);
