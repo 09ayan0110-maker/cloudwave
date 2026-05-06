@@ -31,6 +31,7 @@ let currentUser = store.get("cloudwaveUser", null);
 let ideas = store.get("cloudwaveIdeas", starterIdeas);
 let savedIds = new Set(store.get("cloudwaveSaved", []));
 let conversations = store.get("cloudwaveChats", []);
+let adminIdeas = [];
 let activeChatId = conversations[0]?.id || "";
 let activeFilter = "All";
 let sellStep = 1;
@@ -50,6 +51,7 @@ const chatHeader = document.querySelector("#chat-header");
 const chatThread = document.querySelector("#chat-thread");
 const messageForm = document.querySelector("#message-form");
 const messageInput = document.querySelector("#message-input");
+const adminList = document.querySelector("#admin-list");
 
 function escapeHTML(value) {
   return String(value)
@@ -111,10 +113,14 @@ function applyServerData(data) {
     saveConversations();
     activeChatId = conversations[0]?.id || "";
   }
+  if (Array.isArray(data.adminIdeas)) {
+    adminIdeas = data.adminIdeas;
+  }
   renderTrending();
   renderIdeas();
   renderConversations();
   renderActiveChat();
+  renderAdminPanel();
   renderHomeStats(data.stats);
   updateProfileStats();
 }
@@ -136,6 +142,10 @@ function setScreen(name) {
   if (!currentUser && ["sell", "messages", "profile"].includes(name)) {
     showToast("Create an account to use this section");
     name = "auth";
+  }
+  if (name === "admin" && currentUser?.role !== "Admin") {
+    showToast("Admin access required");
+    name = "home";
   }
   screens.forEach((screen) => screen.classList.toggle("active", screen.id === `${name}-screen`));
   bottomButtons.forEach((button) => button.classList.toggle("active", button.dataset.screen === name));
@@ -840,20 +850,103 @@ function renderHomeStats(serverStats = null) {
   if (statValues[2]) statValues[2].textContent = serverStats?.users ?? (currentUser ? "1" : "0");
 }
 
+function renderAdminPanel() {
+  const bottomNav = document.querySelector(".bottom-nav");
+  bottomNav?.classList.toggle("admin-mode", currentUser?.role === "Admin");
+  if (!adminList) return;
+  if (currentUser?.role !== "Admin") {
+    adminList.innerHTML = `<div class="empty-state"><h3>Admin only</h3><p>Register or log in with an admin account to moderate listings.</p></div>`;
+    return;
+  }
+  const pending = adminIdeas.filter((idea) => idea.status === "pending_review");
+  const live = adminIdeas.filter((idea) => idea.status === "live");
+  const rejected = adminIdeas.filter((idea) => idea.status === "rejected");
+  document.querySelector("#admin-pending-count").textContent = pending.length;
+  document.querySelector("#admin-live-count").textContent = live.length;
+  document.querySelector("#admin-rejected-count").textContent = rejected.length;
+  const ordered = [...pending, ...live, ...rejected];
+  if (!ordered.length) {
+    adminList.innerHTML = `<div class="empty-state"><h3>No listings to review</h3><p>Submitted ideas will appear here before going live.</p></div>`;
+    return;
+  }
+  adminList.innerHTML = ordered
+    .map((idea) => {
+      const quality = qualityGate(idea);
+      return `
+        <article class="admin-card">
+          <div class="card-top">
+            <div>
+              <h3>${escapeHTML(idea.title)}</h3>
+              <p>${escapeHTML(idea.summary)}</p>
+            </div>
+            <span class="tag ${idea.status === "live" ? "teal" : idea.status === "rejected" ? "amber" : ""}">${escapeHTML(idea.status || "pending_review")}</span>
+          </div>
+          <div class="score-row">
+            <span><strong>${quality.score}/100</strong><small>Quality</small></span>
+            <span><strong>${quality.words}</strong><small>Words</small></span>
+            <span><strong>${escapeHTML(idea.seller)}</strong><small>Seller</small></span>
+          </div>
+          <p>${escapeHTML(quality.missing.length ? `Missing: ${quality.missing.join(", ")}` : "All quality requirements passed.")}</p>
+          <div class="admin-actions">
+            <button data-admin-action="approve" data-admin-id="${idea.id}">Approve</button>
+            <button data-admin-action="reject" data-admin-id="${idea.id}">Reject</button>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+async function loadAdminIdeas() {
+  if (currentUser?.role !== "Admin" || !apiAvailable) return;
+  try {
+    const data = await apiRequest("/api/admin/ideas");
+    adminIdeas = data.ideas || [];
+    renderAdminPanel();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function moderateIdea(id, action) {
+  if (!apiAvailable) {
+    const idea = ideas.find((item) => String(item.id) === String(id));
+    if (idea) idea.status = action === "approve" ? "live" : "rejected";
+    adminIdeas = ideas;
+    renderAdminPanel();
+    renderIdeas();
+    showToast(`Listing ${action === "approve" ? "approved" : "rejected"}`);
+    return;
+  }
+  try {
+    const data = await apiRequest(`/api/admin/ideas/${id}/${action}`, { method: "POST" });
+    ideas = data.ideas;
+    adminIdeas = data.ideas;
+    renderAdminPanel();
+    renderIdeas();
+    renderTrending();
+    showToast(`Listing ${action === "approve" ? "approved" : "rejected"}`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 async function createAccount() {
   const name = document.querySelector("#signup-name").value.trim();
   const email = document.querySelector("#signup-email").value.trim();
   const password = document.querySelector("#signup-password").value.trim();
   const role = document.querySelector("#signup-role").value;
+  const adminCode = document.querySelector("#signup-admin-code").value.trim();
   if (!name || !email || password.length < 6) {
     showToast("Enter name, email, and 6+ character password");
     return;
   }
   if (apiAvailable) {
     try {
-      const data = await apiRequest("/api/register", { method: "POST", body: JSON.stringify({ name, email, role, password }) });
+      const data = await apiRequest("/api/register", { method: "POST", body: JSON.stringify({ name, email, role, password, adminCode }) });
       saveAuthToken(data.token);
       applyServerData(data);
+      await loadAdminIdeas();
       showToast("Account created");
       setScreen("home");
     } catch (error) {
@@ -864,6 +957,8 @@ async function createAccount() {
     saveCurrentUser();
     renderHomeStats();
     updateProfileStats();
+    adminIdeas = ideas;
+    renderAdminPanel();
     showToast("Local account created");
     setScreen("home");
   }
@@ -884,6 +979,7 @@ async function loginAccount() {
     const data = await apiRequest("/api/login", { method: "POST", body: JSON.stringify({ email, password }) });
     saveAuthToken(data.token);
     applyServerData(data);
+    await loadAdminIdeas();
     showToast("Logged in");
     setScreen("home");
   } catch (error) {
@@ -942,6 +1038,11 @@ document.addEventListener("click", (event) => {
     activeChatId = chatButton.dataset.chat;
     renderActiveChat();
   }
+
+  const adminAction = event.target.closest("[data-admin-action]");
+  if (adminAction) {
+    moderateIdea(adminAction.dataset.adminId, adminAction.dataset.adminAction);
+  }
 });
 
 filterRow.addEventListener("click", (event) => {
@@ -981,20 +1082,24 @@ async function initApp() {
   if (apiAvailable) {
     try {
       applyServerData(await apiRequest("/api/bootstrap"));
+      await loadAdminIdeas();
     } catch {
       renderTrending();
       renderIdeas();
       renderConversations();
       renderActiveChat();
       renderHomeStats();
+      renderAdminPanel();
       updateProfileStats();
     }
   } else {
+    adminIdeas = ideas;
     renderTrending();
     renderIdeas();
     renderConversations();
     renderActiveChat();
     renderHomeStats();
+    renderAdminPanel();
     updateProfileStats();
   }
   updateSellStep(1);

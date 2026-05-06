@@ -1018,6 +1018,76 @@ textarea {
   font-weight: 800;
 }
 
+.bottom-nav.admin-mode button {
+  width: 16.66%;
+}
+
+.admin-only {
+  display: none !important;
+}
+
+.admin-mode .admin-only {
+  display: grid !important;
+}
+
+.admin-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.admin-stats div {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #fff;
+  text-align: center;
+}
+
+.admin-stats strong {
+  display: block;
+  font-size: 20px;
+}
+
+.admin-stats span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.admin-list {
+  display: grid;
+  gap: 12px;
+}
+
+.admin-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: #fff;
+}
+
+.admin-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.admin-actions button {
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--soft);
+  font-weight: 800;
+}
+
+.admin-actions button:first-child {
+  background: var(--ink);
+  color: #fff;
+}
+
 .bottom-nav button.active {
   color: var(--blue);
 }

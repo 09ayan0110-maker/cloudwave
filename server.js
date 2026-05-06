@@ -8,6 +8,7 @@ const dataDir = path.join(root, "data");
 const dbPath = path.join(dataDir, "cloudwave-db.json");
 const port = process.env.PORT || 3000;
 const host = process.env.HOST || "0.0.0.0";
+const adminCode = process.env.ADMIN_CODE || "CLOUDWAVE-ADMIN";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -75,6 +76,10 @@ function publicUser(user) {
   return { id: user.id, name: user.name, email: user.email, role: user.role, createdAt: user.createdAt };
 }
 
+function isAdmin(user) {
+  return user?.role === "Admin";
+}
+
 function wordCount(text) {
   return String(text || "").trim().split(/\s+/).filter(Boolean).length;
 }
@@ -126,6 +131,7 @@ async function handleApi(req, res) {
       user: publicUser(user),
       ideas: db.ideas,
       chats: user ? db.chats.filter((chat) => chat.userIds.includes(user.id)) : [],
+      adminIdeas: isAdmin(user) ? db.ideas : [],
       stats: { users: db.users.length, ideas: db.ideas.length },
     });
   }
@@ -136,7 +142,9 @@ async function handleApi(req, res) {
     const email = String(body.email || "").trim().toLowerCase();
     const role = String(body.role || "Seller").trim();
     const password = String(body.password || "").trim();
+    const submittedAdminCode = String(body.adminCode || "").trim();
     if (!name || !email || password.length < 6) return json(res, 400, { error: "Name, email, and a 6+ character password are required." });
+    if (role === "Admin" && submittedAdminCode !== adminCode) return json(res, 403, { error: "Invalid admin code." });
     if (db.users.some((user) => user.email === email)) return json(res, 409, { error: "Email is already registered." });
     const user = { id: crypto.randomUUID(), name, email, role, passwordHash: hashPassword(password), createdAt: new Date().toISOString() };
     const token = crypto.randomUUID();
@@ -180,6 +188,35 @@ async function handleApi(req, res) {
     db.ideas.unshift(idea);
     writeDb(db);
     return json(res, 201, { idea, ideas: db.ideas });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/ideas") {
+    const user = userFromToken(req, db);
+    if (!isAdmin(user)) return json(res, 403, { error: "Admin access required." });
+    return json(res, 200, { ideas: db.ideas });
+  }
+
+  if (req.method === "POST" && url.pathname.startsWith("/api/admin/ideas/")) {
+    const user = userFromToken(req, db);
+    if (!isAdmin(user)) return json(res, 403, { error: "Admin access required." });
+    const parts = url.pathname.split("/");
+    const ideaId = parts[4];
+    const action = parts[5];
+    const idea = db.ideas.find((item) => item.id === ideaId);
+    if (!idea) return json(res, 404, { error: "Listing not found." });
+    if (action === "approve") {
+      idea.status = "live";
+      idea.reviewedAt = new Date().toISOString();
+      idea.reviewedBy = user.id;
+    } else if (action === "reject") {
+      idea.status = "rejected";
+      idea.reviewedAt = new Date().toISOString();
+      idea.reviewedBy = user.id;
+    } else {
+      return json(res, 400, { error: "Unknown admin action." });
+    }
+    writeDb(db);
+    return json(res, 200, { idea, ideas: db.ideas });
   }
 
   return json(res, 404, { error: "API route not found." });
