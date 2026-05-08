@@ -24,7 +24,7 @@ const mimeTypes = {
 };
 
 function initialDb() {
-  return { users: [], ideas: [], chats: [], sessions: {}, emailVerificationTokens: {}, passwordResetTokens: {} };
+  return { users: [], ideas: [], chats: [], sessions: {}, passwordResetTokens: {} };
 }
 
 function readDb() {
@@ -35,7 +35,6 @@ function readDb() {
   db.ideas ||= [];
   db.chats ||= [];
   db.sessions ||= {};
-  db.emailVerificationTokens ||= {};
   db.passwordResetTokens ||= {};
   for (const [token, session] of Object.entries(db.sessions)) {
     if (typeof session === "string") {
@@ -109,14 +108,20 @@ function createSession(db, user) {
 
 function publicUser(user) {
   if (!user) return null;
-  return { id: user.id, name: user.name, email: user.email, role: user.role, emailVerified: true, createdAt: user.createdAt };
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    createdAt: user.createdAt,
+  };
 }
 
 function isAdmin(user) {
   return user?.role === "Admin";
 }
 
-function requireVerified(user, res) {
+function requireUser(user, res) {
   if (!user) {
     json(res, 401, { error: "Please log in first." });
     return false;
@@ -177,6 +182,13 @@ function wordCount(text) {
   return String(text || "").trim().split(/\s+/).filter(Boolean).length;
 }
 
+function priceNumber(price) {
+  const clean = String(price || "").replace(/[₹,\s]/g, "").toLowerCase();
+  if (clean.includes("l")) return Number.parseFloat(clean) * 100000;
+  if (clean.includes("k")) return Number.parseFloat(clean) * 1000;
+  return Number.parseFloat(clean) || 0;
+}
+
 function validateIdeaPackage(idea) {
   const fullText = [
     idea.summary,
@@ -203,6 +215,83 @@ function validateIdeaPackage(idea) {
   return checks.filter(Boolean).length >= checks.length - 1;
 }
 
+function analyzeIdeaPackage(idea) {
+  const fullText = [
+    idea.title,
+    idea.summary,
+    idea.problem,
+    idea.solution,
+    idea.target,
+    idea.model,
+    idea.whyNow,
+    idea.roadmap,
+    idea.competitorGaps,
+    idea.marketingStrategy,
+    idea.pricingStrategy,
+    idea.assets,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const text = fullText.toLowerCase();
+  const words = wordCount(fullText);
+  const checks = [
+    wordCount(idea.summary) >= 18,
+    wordCount(idea.target) >= 4,
+    wordCount(idea.competitorGaps) >= 20,
+    wordCount(idea.roadmap) >= 25,
+    wordCount(idea.marketingStrategy) >= 20,
+    wordCount(idea.pricingStrategy) >= 15,
+    Boolean(idea.ownershipDeclared),
+    words >= 300,
+  ];
+  const qualityScore = Math.round((checks.filter(Boolean).length / checks.length) * 100);
+  let strengthScore = 56 + Math.min(18, Math.floor(words / 45));
+  if (["AI", "SaaS", "Fintech", "HealthTech"].includes(idea.category)) strengthScore += 7;
+  if (text.includes("subscription") || text.includes("saas") || text.includes("commission")) strengthScore += 6;
+  if (text.includes("pilot") || text.includes("customer") || text.includes("interview")) strengthScore += 8;
+  if (text.includes("wireframe") || text.includes("prototype") || text.includes("research")) strengthScore += 7;
+  if (priceNumber(idea.price) > 100000) strengthScore -= 4;
+  strengthScore = Math.max(30, Math.min(96, Math.round(strengthScore)));
+
+  const aiPhrases = [
+    "in today's fast-paced world",
+    "game-changer",
+    "revolutionize",
+    "seamlessly",
+    "cutting-edge",
+    "leveraging ai",
+    "unlock the power",
+    "transform the way",
+  ];
+  const phraseHits = aiPhrases.filter((phrase) => text.includes(phrase)).length;
+  const longSentenceCount = String(fullText).split(/[.!?]/).filter((sentence) => wordCount(sentence) > 34).length;
+  const aiGeneratedRisk = Math.max(5, Math.min(92, phraseHits * 18 + longSentenceCount * 8 + (words > 420 && phraseHits ? 12 : 0)));
+
+  const baseByCategory = { AI: 38000, SaaS: 34000, Fintech: 42000, HealthTech: 36000, Marketplace: 32000, Consumer: 24000 };
+  let value = baseByCategory[idea.category] || 24000;
+  value += (strengthScore - 60) * 900;
+  if (text.includes("research") || text.includes("interview")) value += 8000;
+  if (text.includes("wireframe") || text.includes("mockup") || text.includes("prototype")) value += 12000;
+  if (text.includes("pilot") || text.includes("customer")) value += 15000;
+  if (text.includes("subscription") || text.includes("saas")) value += 9000;
+  if (idea.saleType === "Full sale") value += 10000;
+  if (idea.saleType === "Partnership") value -= 5000;
+  const low = Math.max(5000, Math.round(value * 0.78));
+  const high = Math.max(low + 5000, Math.round(value * 1.24));
+  const midpoint = Math.round((low + high) / 2);
+  const asking = priceNumber(idea.price);
+
+  return {
+    qualityScore,
+    strengthScore,
+    aiGeneratedRisk,
+    aiGeneratedLabel: aiGeneratedRisk >= 65 ? "Likely AI-assisted" : aiGeneratedRisk >= 35 ? "Needs human review" : "Looks human-written",
+    valueEstimate: { low, high, midpoint, currency: "INR" },
+    pricingSignal: asking > high ? "Asking price looks high" : asking && asking < low ? "Asking price looks low" : "Asking price is reasonable",
+    generatedAt: new Date().toISOString(),
+  };
+}
+
 function serveFile(req, res) {
   const urlPath = decodeURIComponent(new URL(req.url, `http://${req.headers.host}`).pathname);
   const safePath = urlPath === "/" ? "/index.html" : urlPath;
@@ -225,6 +314,7 @@ async function handleApi(req, res) {
       ideas: db.ideas,
       chats: user ? db.chats.filter((chat) => chat.userIds.includes(user.id)) : [],
       adminIdeas: isAdmin(user) ? db.ideas : [],
+      adminUsers: isAdmin(user) ? db.users.map(publicUser) : [],
       stats: { users: db.users.length, ideas: db.ideas.length },
     });
   }
@@ -239,7 +329,14 @@ async function handleApi(req, res) {
     if (!name || !email || password.length < 6) return json(res, 400, { error: "Name, email, and a 6+ character password are required." });
     if (role === "Admin" && submittedAdminCode !== adminCode) return json(res, 403, { error: "Invalid admin code." });
     if (db.users.some((user) => user.email === email)) return json(res, 409, { error: "Email is already registered." });
-    const user = { id: crypto.randomUUID(), name, email, role, passwordHash: hashPassword(password), emailVerified: true, createdAt: new Date().toISOString() };
+    const user = {
+      id: crypto.randomUUID(),
+      name,
+      email,
+      role,
+      passwordHash: hashPassword(password),
+      createdAt: new Date().toISOString(),
+    };
     const token = createSession(db, user);
     db.users.push(user);
     writeDb(db);
@@ -266,6 +363,27 @@ async function handleApi(req, res) {
       ideas: db.ideas,
       chats: db.chats.filter((chat) => chat.userIds.includes(user.id)),
       message: "Logged in.",
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/login") {
+    const body = await readBody(req);
+    const email = String(body.email || "").trim().toLowerCase();
+    const password = String(body.password || "").trim();
+    const user = db.users.find((item) => item.email === email);
+    if (!user || !verifyPassword(password, user.passwordHash)) return json(res, 401, { error: "Invalid admin email or password." });
+    if (user.role !== "Admin") return json(res, 403, { error: "This login is only for admin accounts." });
+    const token = createSession(db, user);
+    writeDb(db);
+    return json(res, 200, {
+      token,
+      user: publicUser(user),
+      ideas: db.ideas,
+      chats: db.chats.filter((chat) => chat.userIds.includes(user.id)),
+      adminIdeas: db.ideas,
+      adminUsers: db.users.map(publicUser),
+      stats: { users: db.users.length, ideas: db.ideas.length },
+      message: "Admin logged in.",
     });
   }
 
@@ -309,7 +427,7 @@ async function handleApi(req, res) {
 
   if (req.method === "POST" && url.pathname === "/api/profile/change-password") {
     const user = userFromToken(req, db);
-    if (!requireVerified(user, res)) return;
+    if (!requireUser(user, res)) return;
     const body = await readBody(req);
     const currentPassword = String(body.currentPassword || "").trim();
     const newPassword = String(body.newPassword || "").trim();
@@ -328,9 +446,10 @@ async function handleApi(req, res) {
 
   if (req.method === "POST" && url.pathname === "/api/ideas") {
     const user = userFromToken(req, db);
-    if (!requireVerified(user, res)) return;
+    if (!requireUser(user, res)) return;
     const body = await readBody(req);
     if (!validateIdeaPackage(body)) return json(res, 400, { error: "Listing package is too weak. Add 300+ words, competitor gaps, roadmap, marketing/pricing strategy, and ownership declaration." });
+    const analysis = analyzeIdeaPackage(body);
     const idea = {
       ...body,
       id: crypto.randomUUID(),
@@ -338,6 +457,8 @@ async function handleApi(req, res) {
       ownerId: user.id,
       rating: "New",
       status: "pending_review",
+      analysisStatus: "analyzed",
+      analysis,
       createdAt: new Date().toISOString(),
     };
     db.ideas.unshift(idea);
@@ -349,6 +470,12 @@ async function handleApi(req, res) {
     const user = userFromToken(req, db);
     if (!isAdmin(user)) return json(res, 403, { error: "Admin access required." });
     return json(res, 200, { ideas: db.ideas });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/users") {
+    const user = userFromToken(req, db);
+    if (!isAdmin(user)) return json(res, 403, { error: "Admin access required." });
+    return json(res, 200, { users: db.users.map(publicUser) });
   }
 
   if (req.method === "POST" && url.pathname.startsWith("/api/admin/ideas/")) {

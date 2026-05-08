@@ -32,10 +32,12 @@ let ideas = store.get("cloudwaveIdeas", starterIdeas);
 let savedIds = new Set(store.get("cloudwaveSaved", []));
 let conversations = store.get("cloudwaveChats", []);
 let adminIdeas = [];
+let adminUsers = [];
 let activeChatId = conversations[0]?.id || "";
 let activeFilter = "All";
 let sellStep = 1;
 let authToken = store.get("cloudwaveToken", "");
+let loginMode = "customer";
 const apiAvailable = location.protocol === "http:" || location.protocol === "https:";
 
 const screens = document.querySelectorAll(".screen");
@@ -125,6 +127,9 @@ function applyServerData(data) {
   if (Array.isArray(data.adminIdeas)) {
     adminIdeas = data.adminIdeas;
   }
+  if (Array.isArray(data.adminUsers)) {
+    adminUsers = data.adminUsers;
+  }
   renderTrending();
   renderIdeas();
   renderConversations();
@@ -147,6 +152,18 @@ function showToast(message) {
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 2200);
 }
 
+function setLoginMode(mode) {
+  loginMode = mode === "admin" ? "admin" : "customer";
+  document.querySelector("#customer-login-mode")?.classList.toggle("active", loginMode === "customer");
+  document.querySelector("#admin-login-mode")?.classList.toggle("active", loginMode === "admin");
+  const role = document.querySelector("#signup-role");
+  const name = document.querySelector("#signup-name");
+  const adminCode = document.querySelector("#signup-admin-code");
+  if (role && loginMode === "admin") role.value = "Admin";
+  if (name) name.placeholder = loginMode === "admin" ? "Admin name" : "Your name";
+  if (adminCode) adminCode.parentElement.style.display = loginMode === "admin" || role?.value === "Admin" ? "" : "none";
+}
+
 function setScreen(name) {
   if (!currentUser && ["sell", "messages", "profile"].includes(name)) {
     showToast("Create an account to use this section");
@@ -158,6 +175,7 @@ function setScreen(name) {
   }
   screens.forEach((screen) => screen.classList.toggle("active", screen.id === `${name}-screen`));
   bottomButtons.forEach((button) => button.classList.toggle("active", button.dataset.screen === name));
+  if (name === "admin") loadAdminData();
 }
 
 function tagClass(value) {
@@ -379,13 +397,17 @@ function renderDetail(id) {
   if (!idea) return;
   const saved = savedIds.has(String(idea.id));
   const assessment = assessIdea(idea);
+  const storedAnalysis = idea.analysis || {};
+  const fallbackValue = estimateIdeaValue(idea);
+  const valueEstimate = storedAnalysis.valueEstimate || fallbackValue;
+  const storedScore = storedAnalysis.strengthScore || qualityGate(idea).score;
   detailContent.innerHTML = `
     <section class="detail-hero">
       <span class="tag ${tagClass(idea.category)}">${escapeHTML(idea.category)}</span>
       <h2>${escapeHTML(idea.title)}</h2>
       <p>${escapeHTML(idea.summary)}</p>
       <div class="score-row">
-        <span><strong>${escapeHTML(idea.seller)}</strong><small>Verified creator</small></span>
+        <span><strong>${escapeHTML(idea.seller)}</strong><small>Seller</small></span>
         <span><strong>${escapeHTML(idea.revenue)}/10</strong><small>AI forecast</small></span>
       </div>
     </section>
@@ -406,10 +428,12 @@ function renderDetail(id) {
         <p>${idea.status === "live" ? "This opportunity passed the listing quality gate." : "This package is submitted but should be reviewed before buyers can purchase."}</p>
       </div>
       <div class="assessment-score">
-        <strong>${qualityGate(idea).score}</strong>
+        <strong>${storedScore}</strong>
         <span>/100</span>
       </div>
       <div class="assessment-grid">
+        <div><b>Estimated value</b><p>${formatRupees(valueEstimate.low)}-${formatRupees(valueEstimate.high)}. ${escapeHTML(storedAnalysis.pricingSignal || fallbackValue.verdict)}</p></div>
+        <div><b>AI-generated risk</b><p>${escapeHTML(storedAnalysis.aiGeneratedLabel || "Needs review")} (${storedAnalysis.aiGeneratedRisk ?? "n/a"})</p></div>
         <div><b>Risk</b><p>${escapeHTML(assessment.risk)}</p></div>
         <div><b>Recommendation</b><p>${escapeHTML(assessment.recommendation)}</p></div>
         <div><b>Buyer warning</b><p>Cloudwave lists business opportunities, not guaranteed results. Execution risk remains with the buyer.</p></div>
@@ -883,13 +907,12 @@ function renderAdminPanel() {
   document.querySelector("#admin-live-count").textContent = live.length;
   document.querySelector("#admin-rejected-count").textContent = rejected.length;
   const ordered = [...pending, ...live, ...rejected];
-  if (!ordered.length) {
-    adminList.innerHTML = `<div class="empty-state"><h3>No listings to review</h3><p>Submitted ideas will appear here before going live.</p></div>`;
-    return;
-  }
-  adminList.innerHTML = ordered
+  const ideaReview = ordered.length
+    ? ordered
     .map((idea) => {
       const quality = qualityGate(idea);
+      const analysis = idea.analysis || {};
+      const value = analysis.valueEstimate;
       return `
         <article class="admin-card">
           <div class="card-top">
@@ -900,10 +923,13 @@ function renderAdminPanel() {
             <span class="tag ${idea.status === "live" ? "teal" : idea.status === "rejected" ? "amber" : ""}">${escapeHTML(idea.status || "pending_review")}</span>
           </div>
           <div class="score-row">
-            <span><strong>${quality.score}/100</strong><small>Quality</small></span>
+            <span><strong>${analysis.qualityScore || quality.score}/100</strong><small>Quality</small></span>
+            <span><strong>${analysis.aiGeneratedRisk ?? "n/a"}</strong><small>AI risk</small></span>
+            <span><strong>${value ? formatRupees(value.midpoint) : "n/a"}</strong><small>Value</small></span>
             <span><strong>${quality.words}</strong><small>Words</small></span>
             <span><strong>${escapeHTML(idea.seller)}</strong><small>Seller</small></span>
           </div>
+          <p>${escapeHTML(analysis.aiGeneratedLabel || "No server analysis yet.")}</p>
           <p>${escapeHTML(quality.missing.length ? `Missing: ${quality.missing.join(", ")}` : "All quality requirements passed.")}</p>
           <div class="admin-actions">
             <button data-admin-action="approve" data-admin-id="${idea.id}">Approve</button>
@@ -912,14 +938,34 @@ function renderAdminPanel() {
         </article>
       `;
     })
-    .join("");
+    .join("")
+    : `<div class="empty-state"><h3>No listings to review</h3><p>Submitted ideas will appear here before going live.</p></div>`;
+  const userReview = adminUsers.length
+    ? adminUsers
+        .map((user) => `
+          <article class="admin-card">
+            <div class="card-top">
+              <div>
+                <h3>${escapeHTML(user.name)}</h3>
+                <p>${escapeHTML(user.email)}</p>
+              </div>
+              <span class="tag ${user.role === "Admin" ? "teal" : ""}">${escapeHTML(user.role)}</span>
+            </div>
+            <p>Joined ${escapeHTML(new Date(user.createdAt || Date.now()).toLocaleDateString())}</p>
+          </article>
+        `)
+        .join("")
+    : `<div class="empty-state"><h3>No users yet</h3><p>New accounts will appear here.</p></div>`;
+  adminList.innerHTML = `<h3 class="admin-section-title">Idea review</h3>${ideaReview}<h3 class="admin-section-title">Users</h3>${userReview}`;
 }
 
-async function loadAdminIdeas() {
+async function loadAdminData() {
   if (currentUser?.role !== "Admin" || !apiAvailable) return;
   try {
     const data = await apiRequest("/api/admin/ideas");
     adminIdeas = data.ideas || [];
+    const users = await apiRequest("/api/admin/users");
+    adminUsers = users.users || [];
     renderAdminPanel();
   } catch (error) {
     showToast(error.message);
@@ -964,7 +1010,7 @@ async function createAccount() {
       const data = await apiRequest("/api/register", { method: "POST", body: JSON.stringify({ name, email, role, password, adminCode }) });
       saveAuthToken(data.token);
       applyServerData(data);
-      await loadAdminIdeas();
+      await loadAdminData();
       showToast(data.message || "Account created");
       setScreen("home");
     } catch (error) {
@@ -994,10 +1040,11 @@ async function loginAccount() {
     return;
   }
   try {
-    const data = await apiRequest("/api/login", { method: "POST", body: JSON.stringify({ email, password }) });
+    const path = loginMode === "admin" ? "/api/admin/login" : "/api/login";
+    const data = await apiRequest(path, { method: "POST", body: JSON.stringify({ email, password }) });
     saveAuthToken(data.token);
     applyServerData(data);
-    await loadAdminIdeas();
+    await loadAdminData();
     showToast(data.message || "Logged in");
     setScreen("home");
   } catch (error) {
@@ -1067,6 +1114,7 @@ async function logoutAccount() {
   currentUser = null;
   conversations = [];
   adminIdeas = [];
+  adminUsers = [];
   saveCurrentUser();
   renderConversations();
   renderActiveChat();
@@ -1132,6 +1180,7 @@ document.addEventListener("click", (event) => {
   if (adminAction) {
     moderateIdea(adminAction.dataset.adminId, adminAction.dataset.adminAction);
   }
+
 });
 
 filterRow.addEventListener("click", (event) => {
@@ -1161,6 +1210,9 @@ messageForm.addEventListener("submit", (event) => {
 
 document.querySelector("#create-account")?.addEventListener("click", createAccount);
 document.querySelector("#login-account")?.addEventListener("click", loginAccount);
+document.querySelector("#customer-login-mode")?.addEventListener("click", () => setLoginMode("customer"));
+document.querySelector("#admin-login-mode")?.addEventListener("click", () => setLoginMode("admin"));
+document.querySelector("#signup-role")?.addEventListener("change", () => setLoginMode(document.querySelector("#signup-role").value === "Admin" ? "admin" : "customer"));
 document.querySelector("#forgot-password")?.addEventListener("click", forgotPassword);
 document.querySelector("#reset-password-button")?.addEventListener("click", resetPassword);
 document.querySelector("#change-password-button")?.addEventListener("click", changePassword);
@@ -1172,6 +1224,7 @@ document.querySelector("#continue-guest")?.addEventListener("click", () => {
 });
 
 async function initApp() {
+  setLoginMode("customer");
   const params = new URLSearchParams(location.search);
   const resetParam = params.get("reset");
   if (resetParam) {
@@ -1181,7 +1234,7 @@ async function initApp() {
   if (apiAvailable) {
     try {
       applyServerData(await apiRequest("/api/bootstrap"));
-      await loadAdminIdeas();
+      await loadAdminData();
     } catch {
       renderTrending();
       renderIdeas();
