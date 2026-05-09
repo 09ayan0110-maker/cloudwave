@@ -164,6 +164,29 @@ function setLoginMode(mode) {
   if (adminCode) adminCode.parentElement.style.display = loginMode === "admin" || role?.value === "Admin" ? "" : "none";
 }
 
+function setupPasswordToggles() {
+  document.querySelectorAll('input[type="password"]').forEach((input) => {
+    if (input.dataset.toggleReady) return;
+    input.dataset.toggleReady = "true";
+    const wrapper = document.createElement("span");
+    wrapper.className = "password-field";
+    input.parentNode.insertBefore(wrapper, input);
+    wrapper.appendChild(input);
+    const button = document.createElement("button");
+    button.className = "password-toggle";
+    button.type = "button";
+    button.setAttribute("aria-label", "Show password");
+    button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>';
+    button.addEventListener("click", () => {
+      const showing = input.type === "text";
+      input.type = showing ? "password" : "text";
+      button.setAttribute("aria-label", showing ? "Show password" : "Hide password");
+      button.classList.toggle("active", !showing);
+    });
+    wrapper.appendChild(button);
+  });
+}
+
 function setScreen(name) {
   if (!currentUser && ["sell", "messages", "profile"].includes(name)) {
     showToast("Create an account to use this section");
@@ -949,9 +972,14 @@ function renderAdminPanel() {
                 <h3>${escapeHTML(user.name)}</h3>
                 <p>${escapeHTML(user.email)}</p>
               </div>
-              <span class="tag ${user.role === "Admin" ? "teal" : ""}">${escapeHTML(user.role)}</span>
+              <span class="tag ${user.status === "banned" ? "amber" : user.role === "Admin" ? "teal" : ""}">${escapeHTML(user.status === "banned" ? "Banned" : user.timeoutUntil && new Date(user.timeoutUntil).getTime() > Date.now() ? "Timed out" : user.role)}</span>
             </div>
-            <p>Joined ${escapeHTML(new Date(user.createdAt || Date.now()).toLocaleDateString())}</p>
+            <p>Joined ${escapeHTML(new Date(user.createdAt || Date.now()).toLocaleDateString())}${user.timeoutUntil ? ` · Timeout until ${escapeHTML(new Date(user.timeoutUntil).toLocaleString())}` : ""}</p>
+            <div class="admin-actions">
+              <button data-user-action="timeout" data-user-id="${escapeHTML(user.id)}">Timeout 24h</button>
+              <button data-user-action="${user.status === "banned" ? "unban" : "ban"}" data-user-id="${escapeHTML(user.id)}">${user.status === "banned" ? "Unban" : "Ban"}</button>
+              <button data-user-action="delete" data-user-id="${escapeHTML(user.id)}">Delete</button>
+            </div>
           </article>
         `)
         .join("")
@@ -990,6 +1018,26 @@ async function moderateIdea(id, action) {
     renderIdeas();
     renderTrending();
     showToast(`Listing ${action === "approve" ? "approved" : "rejected"}`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function moderateUser(id, action) {
+  if (currentUser?.role !== "Admin" || !apiAvailable) return;
+  if (action === "delete" && !window.confirm("Delete this account and its listings? This cannot be undone.")) return;
+  try {
+    const data = await apiRequest(`/api/admin/users/${id}/${action}`, { method: "POST" });
+    adminUsers = data.users || [];
+    if (Array.isArray(data.ideas)) {
+      adminIdeas = data.ideas;
+      ideas = data.ideas;
+    }
+    renderAdminPanel();
+    renderIdeas();
+    renderTrending();
+    const labels = { ban: "Account banned", unban: "Account unbanned", timeout: "Account timed out for 24 hours", delete: "Account deleted" };
+    showToast(labels[action] || "Account updated");
   } catch (error) {
     showToast(error.message);
   }
@@ -1181,6 +1229,10 @@ document.addEventListener("click", (event) => {
     moderateIdea(adminAction.dataset.adminId, adminAction.dataset.adminAction);
   }
 
+  const userAction = event.target.closest("[data-user-action]");
+  if (userAction) {
+    moderateUser(userAction.dataset.userId, userAction.dataset.userAction);
+  }
 });
 
 filterRow.addEventListener("click", (event) => {
@@ -1224,6 +1276,7 @@ document.querySelector("#continue-guest")?.addEventListener("click", () => {
 });
 
 async function initApp() {
+  setupPasswordToggles();
   setLoginMode("customer");
   const params = new URLSearchParams(location.search);
   const resetParam = params.get("reset");

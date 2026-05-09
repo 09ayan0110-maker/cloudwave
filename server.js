@@ -97,7 +97,9 @@ function userFromToken(req, db) {
     writeDb(db);
     return null;
   }
-  return db.users.find((user) => user.id === session.userId) || null;
+  const user = db.users.find((item) => item.id === session.userId) || null;
+  if (!user || user.status === "banned" || new Date(user.timeoutUntil || 0).getTime() > Date.now()) return null;
+  return user;
 }
 
 function createSession(db, user) {
@@ -113,6 +115,8 @@ function publicUser(user) {
     name: user.name,
     email: user.email,
     role: user.role,
+    status: user.status || "active",
+    timeoutUntil: user.timeoutUntil || null,
     createdAt: user.createdAt,
   };
 }
@@ -335,6 +339,7 @@ async function handleApi(req, res) {
       email,
       role,
       passwordHash: hashPassword(password),
+      status: "active",
       createdAt: new Date().toISOString(),
     };
     const token = createSession(db, user);
@@ -355,6 +360,8 @@ async function handleApi(req, res) {
     const password = String(body.password || "").trim();
     const user = db.users.find((item) => item.email === email);
     if (!user || !verifyPassword(password, user.passwordHash)) return json(res, 401, { error: "Invalid email or password." });
+    if (user.status === "banned") return json(res, 403, { error: "This account has been banned." });
+    if (new Date(user.timeoutUntil || 0).getTime() > Date.now()) return json(res, 403, { error: "This account is temporarily timed out. Try again later." });
     const token = createSession(db, user);
     writeDb(db);
     return json(res, 200, {
@@ -373,6 +380,8 @@ async function handleApi(req, res) {
     const user = db.users.find((item) => item.email === email);
     if (!user || !verifyPassword(password, user.passwordHash)) return json(res, 401, { error: "Invalid admin email or password." });
     if (user.role !== "Admin") return json(res, 403, { error: "This login is only for admin accounts." });
+    if (user.status === "banned") return json(res, 403, { error: "This admin account has been banned." });
+    if (new Date(user.timeoutUntil || 0).getTime() > Date.now()) return json(res, 403, { error: "This admin account is temporarily timed out. Try again later." });
     const token = createSession(db, user);
     writeDb(db);
     return json(res, 200, {
@@ -476,6 +485,47 @@ async function handleApi(req, res) {
     const user = userFromToken(req, db);
     if (!isAdmin(user)) return json(res, 403, { error: "Admin access required." });
     return json(res, 200, { users: db.users.map(publicUser) });
+  }
+
+  if (req.method === "POST" && url.pathname.startsWith("/api/admin/users/")) {
+    const user = userFromToken(req, db);
+    if (!isAdmin(user)) return json(res, 403, { error: "Admin access required." });
+    const parts = url.pathname.split("/");
+    const userId = parts[4];
+    const action = parts[5];
+    const target = db.users.find((item) => item.id === userId);
+    if (!target) return json(res, 404, { error: "User not found." });
+    if (target.id === user.id) return json(res, 400, { error: "You cannot moderate your own admin account." });
+
+    if (action === "ban") {
+      target.status = "banned";
+      target.timeoutUntil = null;
+      target.moderatedAt = new Date().toISOString();
+      target.moderatedBy = user.id;
+    } else if (action === "unban") {
+      target.status = "active";
+      target.timeoutUntil = null;
+      target.moderatedAt = new Date().toISOString();
+      target.moderatedBy = user.id;
+    } else if (action === "timeout") {
+      target.status = "active";
+      target.timeoutUntil = new Date(Date.now() + 24 * oneHourMs).toISOString();
+      target.moderatedAt = new Date().toISOString();
+      target.moderatedBy = user.id;
+    } else if (action === "delete") {
+      db.users = db.users.filter((item) => item.id !== userId);
+      db.ideas = db.ideas.filter((idea) => idea.ownerId !== userId);
+      db.chats = db.chats.filter((chat) => !chat.userIds?.includes(userId));
+      db.passwordResetTokens = Object.fromEntries(Object.entries(db.passwordResetTokens).filter(([, record]) => record.userId !== userId));
+    } else {
+      return json(res, 400, { error: "Unknown user action." });
+    }
+
+    for (const [sessionToken, session] of Object.entries(db.sessions)) {
+      if (session.userId === userId) delete db.sessions[sessionToken];
+    }
+    writeDb(db);
+    return json(res, 200, { users: db.users.map(publicUser), ideas: db.ideas });
   }
 
   if (req.method === "POST" && url.pathname.startsWith("/api/admin/ideas/")) {
