@@ -1,36 +1,21 @@
-# Cloudwave Deployment
+# Cloudwave Deploy Notes
 
-Cloudwave now has two modes:
+## Render
 
-- Opening `index.html` directly: local demo mode. Registration stays on that browser only.
-- Running `node server.js`: shared app mode. Multiple people can register and see shared listings.
+Use this start command:
 
-## Run Locally
-
-```bash
+```sh
 node server.js
 ```
 
-Then open:
+Set these environment variables:
 
-```text
-http://127.0.0.1:3000
+```sh
+NODE_ENV=production
+ADMIN_CODE=your-private-admin-code
+RESEND_API_KEY=your-resend-api-key
+FROM_EMAIL=Cloudwave <onboarding@resend.dev>
+APP_URL=https://your-render-app.onrender.com
 ```
 
-## Host It
-
-Use a Node hosting service, not static Netlify Drop. Static hosting cannot store shared users.
-
-Recommended settings:
-
-- Build command: leave blank
-- Start command: `node server.js`
-- Node version: 18 or newer
-
-The app stores MVP data in:
-
-```text
-data/cloudwave-db.json
-```
-
-For a serious production launch, replace this JSON file with PostgreSQL, Supabase, Firebase, or another managed database.
+`RESEND_API_KEY` enables real password reset emails. `FROM_EMAIL` must be a sender that Resend allows. For first tests, Resend's default onboarding sender may only send to your own verified email; for real users, verify your domain in Resend and use that domain.
